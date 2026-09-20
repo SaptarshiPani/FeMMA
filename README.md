@@ -168,8 +168,8 @@ Pitch:
 
 Voice quality:
     shimmer
-    HNR
-    CPP
+    Harmonics-to-Noise Ratio
+    Cepstral Peak Prominence
 
 Spectral shape:
     spectral centroid
@@ -189,7 +189,7 @@ Temporal / phase cues:
     very-high-frequency energy
     group-delay variance
     modulation energy
-    MFCC-delta variance
+    Mel-Frequency Cepstral Coefficients-delta variance
 ```
 
 The complete descriptor is
