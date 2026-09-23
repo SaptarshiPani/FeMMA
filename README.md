@@ -4586,3 +4586,89 @@ federated optimization
 ```
 
 into a single final forgery decision.
+
+
+## Game-Theoretic Alignment Mechanism
+
+FeMMA combines three decision branches that each estimate a forgery probability from the same fused embedding `e_i`:
+
+- **H — Discriminative head**: a plain linear classifier trained with BCE.
+- **M — Attack-aware prototype-metric branch**: distance-based scoring against bonafide/attack prototypes.
+- **A — CLAP text-anchor alignment branch**: cosine similarity to signal-conditioned semantic anchors.
+
+Under heterogeneous, attack-disjoint, non-IID federated clients, **H** and **A** tend to become reliable on *different* attack types: H learns local, client-specific discriminative cues, while A reasons over globally broadcast, signal-conditioned semantic descriptions and can therefore generalize to attack types a given client has never observed locally. A single fixed alignment loss weight cannot adapt to this attack-dependent disagreement between the two views. To address this, we cast **H and A as players in a soft Prisoner's Dilemma (PD)** per attack type, and use the resulting game loss to adaptively condition cross-view alignment on how reliable each view currently is.
+
+### 1. Soft cooperation degrees
+
+The mechanism operates on the **globally broadcast class means** `{μ_c}` (not raw samples), re-embedded each round through the client's current encoder — this is what lets clients receive corrective signal even for attacks they never locally observe.
+
+For each attack `a`, both branches score the bonafide mean (`c=0`) and the attack-`a` mean:
+
+```
+p^H_a = sig(w_h^T g_θ(μ_a) + b_h)      # H's forgery probability on the attack-a mean
+p^A_a                                   # A's analogous forgery probability (CLAP-anchor cosine score)
+```
+
+The **margin** of each view — how confidently it separates attack `a` from bonafide — is:
+
+```
+m^H_a = p^H_a − p^H_0
+m^A_a = p^A_a − p^A_0
+```
+
+These margins are passed through a sigmoid with sharpness `κ` and threshold `τ_g` to obtain **soft cooperation degrees**:
+
+```
+q_a = sig[κ(m^H_a − τ_g)]     # H's "probability of cooperating" on attack a
+p_a = sig[κ(m^A_a − τ_g)]     # A's "probability of cooperating" on attack a
+```
+
+"Cooperation" is thus redefined, per branch and per attack, as *"this view currently separates attack `a` from bonafide with margin above threshold `τ_g`."* Failing to do so is "defection." Using a sigmoid rather than a hard threshold makes `q_a`, `p_a` continuous, differentiable relaxations of discrete PD strategies, which is what allows the game to be embedded inside a trainable loss.
+
+### 2. Payoffs and expected utility
+
+Standard PD payoff ordering is imposed: `π_T > π_R > π_P > π_S` (Temptation > Reward > Punishment > Sucker). Treating `(p_a, q_a)` as independent mixed strategies for A and H respectively, the **expected utility for branch A** on attack `a` is:
+
+```
+U_a = p_a · q_a · π_R              # both cooperate  → mutual reward
+    + p_a · (1 − q_a) · π_S        # A cooperates, H defects → A is exploited
+    + (1 − p_a) · q_a · π_T        # A defects, H cooperates → A free-rides
+    + (1 − p_a)(1 − q_a) · π_P     # both defect     → mutual punishment
+```
+
+`U_a` is highest when **both branches are jointly confident** on attack `a` (mutual cooperation), and is degraded by any asymmetric-confidence case, penalizing situations where the two views disagree about which of them should "own" a given attack type.
+
+### 3. The game loss
+
+```
+L_game = (1 / |A|) · Σ_a  sg[1 − q_a] · (−U_a)
+```
+
+Two mechanisms are combined here:
+
+- **`(1 − q_a)` is the per-attack difficulty weight.** It is large exactly when H fails to cooperate on attack `a` (its margin is below threshold), so the loss concentrates gradient signal on attacks where the discriminative head is currently weak, pushing the alignment branch A to compensate.
+- **`sg[·]` (stop-gradient) is applied only to this weight, not to `U_a`.** Without it, the optimizer could learn to deliberately worsen H on some attack purely to inflate its own loss weight `(1 − q_a)` — a degenerate incentive that rewards making H worse rather than making A better. Freezing the weight as a non-differentiable scalar leaves gradient flowing only through `U_a`'s dependence on `p_a`, so training genuinely improves alignment on attacks flagged as hard, instead of allowing the mechanism to be gamed.
+- The `−U_a` sign converts *maximizing* expected mutual-cooperation payoff into a *minimizable* loss term.
+
+A **2-round game-term warm-up** is used before `L_game` is activated, since `p^H`/`p^A` on the class means are unreliable early in training.
+
+### 4. Why the Prisoner's Dilemma framing (not just difficulty weighting)
+
+In the linear-payoff limit, the mechanism reduces exactly to adaptive difficulty weighting by `(1 − q_a)`. This makes explicit what the PD framing adds over a naive heuristic: a **weighting-only** scheme sets the per-attack loss weight using *only* H's confidence, ignoring what A itself is doing. The full PD formulation instead folds in `p_a` through the four-term expected-utility expression, so the gradient magnitude and direction are shaped by the **joint** state of both branches, not H's confidence alone — asymmetric cases (temptation/sucker) are penalized differently than symmetric mutual defection, even at matched `(1 − q_a)`.
+
+Ablation results support this directly:
+
+| Variant | EER (%) | min t-DCF |
+|---|---|---|
+| **Full FeMMA (game-theoretic loss)** | **0.30** | **0.0348** |
+| w/o game-theoretic loss (removed entirely) | 0.71 | 0.0428 |
+| "Adaptive weighting" (plain `(1 − q_a)`-weighted term, no PD payoff structure) | 2.89 | 0.0757 |
+
+Removing the game-theoretic loss entirely (0.71%) is *less damaging* than replacing it with the simplified, one-sided adaptive-weighting heuristic (2.89%). This indicates the improvement is not simply from "weighting hard attacks more," but specifically from the coupled two-player payoff structure that penalizes disagreement between the two complementary decision views — an effect a single-sided weight cannot express.
+
+### 5. Practical notes
+
+- Operates only on broadcast class means `{μ_c}`, so it adds no extra communication cost beyond the per-class sufficient statistics already exchanged for the prototype branch.
+- Consistently low per-attack EER is maintained across all 19 ASVspoof 2019 LA attack types and across all clients (see per-attack/per-client diagnostics), supporting the claim that the mechanism corrects globally-difficult attacks even on clients that never observed them locally.
+- Key hyperparameters: sharpness `κ`, cooperation threshold `τ_g`, payoff values `(π_T, π_R, π_P, π_S)`, and the 2-round warm-up length — tune/document these against your actual config values.
+
